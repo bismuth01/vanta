@@ -1,0 +1,18 @@
+# never ship secrets
+.env
+.env.*
+engine/.env.*
+# not needed in the image
+.git/
+.logs/
+node_modules/
+engine/node_modules/
+contracts/lib/
+contracts/cache/
+contracts/broadcast/
+contracts/src/
+contracts/test/
+contracts/script/
+docs/
+*.md
+Dockerfile.dev

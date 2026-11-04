@@ -1,0 +1,135 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Vanta · Sealed-strategy dark pool on Monad</title>
+    <link rel="stylesheet" href="/style.css" />
+  </head>
+  <body>
+    <header class="top">
+      <div class="brand">
+        <svg viewBox="0 0 32 32" width="28" height="28" aria-hidden="true">
+          <path d="M16 2 30 16 16 30 2 16Z" fill="none" stroke="var(--accent)" stroke-width="2.5" />
+          <path d="M16 9 23 16 16 23 9 16Z" fill="var(--accent)" />
+        </svg>
+        <div>
+          <h1>Vanta</h1>
+          <p>Sealed-strategy dark pool on Monad</p>
+        </div>
+      </div>
+      <div class="pills">
+        <span class="pill" id="chain">connecting…</span>
+        <span class="pill"><span class="muted">block</span> <b id="block">—</b></span>
+        <span class="pill phase" id="phase">market idle</span>
+        <span class="pill conn" id="conn"><span class="dot"></span> live</span>
+        <button class="pill run" id="run-scenario" hidden>▶ Run market scenario</button>
+      </div>
+    </header>
+
+    <section class="attest card">
+      <div class="attest-badge" id="attest-badge">
+        <svg viewBox="0 0 20 20" width="18" height="18" aria-hidden="true"><path d="M4 10.5 8 14.5 16 6" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" /></svg>
+        <span id="attest-text">Waiting for enclave…</span>
+      </div>
+      <dl>
+        <div><dt>Enclave signer</dt><dd class="mono" id="enc-signer">—</dd></div>
+        <div><dt>Code measurement</dt><dd class="mono" id="enc-measure">—</dd></div>
+        <div><dt>Encryption key (x25519)</dt><dd class="mono" id="enc-key">—</dd></div>
+        <div><dt>Trust model</dt><dd>Intel TDX (simulated) · on-chain registry · contract-enforced guards</dd></div>
+      </dl>
+    </section>
+
+    <section class="kpis" id="kpis"></section>
+
+    <main class="grid">
+      <section class="card charts">
+        <div class="card-head">
+          <h2>Market <span class="muted">· last 200 blocks</span></h2>
+          <button class="ghost" id="toggle-table" aria-pressed="false">Table view</button>
+        </div>
+        <div class="chart-block">
+          <div class="chart-title">
+            <span>Price, USDC per MON</span>
+            <span class="legend">
+              <span class="key"><i class="line" style="--c: var(--s-oracle)"></i>Oracle</span>
+              <span class="key"><i class="line" style="--c: var(--s-amm)"></i>Public AMM spot</span>
+            </span>
+          </div>
+          <svg id="price-chart" class="chart" role="img" aria-label="Oracle and AMM price per block"></svg>
+        </div>
+        <div class="chart-block">
+          <div class="chart-title">
+            <span>Settled volume per block, MON</span>
+            <span class="legend">
+              <span class="key"><i class="rect" style="--c: var(--s-cross)"></i>Crossed in dark pool</span>
+              <span class="key"><i class="rect" style="--c: var(--s-amm)"></i>Routed to public AMM</span>
+            </span>
+          </div>
+          <svg id="volume-chart" class="chart short" role="img" aria-label="Crossed versus routed volume per block"></svg>
+        </div>
+        <div class="tooltip" id="tooltip" hidden></div>
+        <div class="table-wrap" id="table-wrap" hidden>
+          <table>
+            <thead><tr><th>Block</th><th>Oracle</th><th>AMM</th><th>Crossed</th><th>Routed</th><th>Eval ms</th></tr></thead>
+            <tbody id="data-table"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="card enclave">
+        <div class="card-head">
+          <h2><span class="lock">🔒</span> Inside the enclave</h2>
+          <span class="tag">demo-only view</span>
+        </div>
+        <p class="hint">Decrypted strategies, private parameters and state live only here. In production this panel does not exist.</p>
+        <div id="strategies" class="strategies"></div>
+      </section>
+    </main>
+
+    <section class="grid bottom">
+      <section class="card mev">
+        <div class="card-head">
+          <h2><span class="eye">👁</span> What MEV bots see</h2>
+          <span class="tag">public chain view</span>
+        </div>
+        <div class="mev-row">
+          <div class="mev-label">Mempool</div>
+          <div class="mev-val"><code>newPendingTransactions</code> is not supported on Monad, and txs go only to the next 3 leaders. <b>Nothing pending to front-run.</b></div>
+        </div>
+        <div class="mev-row">
+          <div class="mev-label">Strategies</div>
+          <div class="mev-val">
+            <div id="commitments" class="commitments"></div>
+          </div>
+        </div>
+        <div class="mev-row">
+          <div class="mev-label">Last settlement</div>
+          <div class="mev-val" id="mev-last">—</div>
+        </div>
+      </section>
+
+      <section class="card feed">
+        <div class="card-head">
+          <h2>Settlement feed</h2>
+          <span class="muted small" id="feed-meta"></span>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>Eval → incl.</th><th>Fills</th><th class="num">Crossed</th><th class="num">Routed</th><th class="num">Saved</th><th class="num">Gas used / limit</th><th>Tx</th></tr>
+            </thead>
+            <tbody id="feed"></tbody>
+          </table>
+        </div>
+      </section>
+    </section>
+
+    <footer>
+      Strategies are Solidity contracts that are <b>never deployed</b>: encrypted to an attested enclave, run every block via
+      <code>eth_call</code> + state override against live Monad state, settled atomically by <code>DarkPool.settle()</code>.
+    </footer>
+
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>

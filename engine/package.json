@@ -1,0 +1,25 @@
+{
+  "name": "vanta-engine",
+  "private": true,
+  "type": "module",
+  "description": "Vanta Sealed Strategy Engine (simulated TEE), firm onboarding CLI and market simulator",
+  "scripts": {
+    "engine": "node src/engine.ts",
+    "firms": "node src/firms.ts",
+    "sim": "node src/sim.ts",
+    "typecheck": "tsc -p .",
+    "fund": "node src/fund.ts"
+  },
+  "engines": {
+    "node": ">=22.18"
+  },
+  "dependencies": {
+    "viem": "^2.57.16",
+    "ws": "^8.22.1"
+  },
+  "devDependencies": {
+    "@types/node": "^24.19.2",
+    "@types/ws": "^8.18.2",
+    "typescript": "^7.0.2"
+  }
+}

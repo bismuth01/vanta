@@ -1,0 +1,12 @@
+node_modules/
+contracts/out/
+contracts/cache/
+contracts/broadcast/
+.logs/
+deployments/31337.json
+# secrets: private keys and tokens live only in these files
+.env
+.env.*
+!.env.*.example
+engine/.env.*
+!engine/.env.*.example
