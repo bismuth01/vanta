@@ -29,7 +29,7 @@ interface IERC20 {
 contract DarkPool is IDarkPoolBalances {
     // ─────────────────────────────── types ───────────────────────────────
     struct Fill {
-        bytes32 strategyId; // commitment = keccak256(abi.encode(runtimeCode, initState))
+        bytes32 strategyId; // keccak256(abi.encode(firm, keccak256(abi.encode(runtimeCode, initState))))
         bool isBuy;
         uint256 baseAmount;
     }
@@ -81,7 +81,7 @@ contract DarkPool is IDarkPoolBalances {
     // ─────────────────────────────── events ───────────────────────────────
     event Deposit(address indexed firm, address indexed token, uint256 amount);
     event Withdraw(address indexed firm, address indexed token, uint256 amount);
-    event StrategyRegistered(address indexed firm, bytes32 indexed strategyId);
+    event StrategyRegistered(address indexed firm, bytes32 indexed strategyId, bytes32 commitment);
     event StrategyStatus(bytes32 indexed strategyId, bool active);
     event RiskLimitSet(address indexed firm, uint256 maxNotionalPerBatch);
     event Filled(
@@ -121,10 +121,15 @@ contract DarkPool is IDarkPoolBalances {
 
     // ─────────────────────────────── firm API ───────────────────────────────
     function deposit(address token, uint256 amount) external {
+        depositFor(msg.sender, token, amount);
+    }
+
+    /// @notice Credit any firm's vault (used by the demo faucet so guests need no token txs).
+    function depositFor(address firm, address token, uint256 amount) public {
         _checkToken(token);
         IERC20(token).transferFrom(msg.sender, address(this), amount);
-        balanceOf[msg.sender][token] += amount;
-        emit Deposit(msg.sender, token, amount);
+        balanceOf[firm][token] += amount;
+        emit Deposit(firm, token, amount);
     }
 
     function withdraw(address token, uint256 amount) external {
@@ -134,11 +139,24 @@ contract DarkPool is IDarkPoolBalances {
         emit Withdraw(msg.sender, token, amount);
     }
 
+    /// @notice strategyId binds a commitment to its firm, so nobody can squat someone else's hash.
+    function strategyIdOf(address firm, bytes32 commitment) public pure returns (bytes32) {
+        return keccak256(abi.encode(firm, commitment));
+    }
+
     /// @notice Publish only a hash. The code itself goes encrypted to the enclave.
-    function registerStrategy(bytes32 commitment) external {
-        require(strategies[commitment].firm == address(0), "exists");
-        strategies[commitment] = StrategyInfo(msg.sender, true, uint64(block.number));
-        emit StrategyRegistered(msg.sender, commitment);
+    /// @param commitment keccak256(abi.encode(runtimeCode, initState))
+    function registerStrategy(bytes32 commitment) public returns (bytes32 strategyId) {
+        strategyId = strategyIdOf(msg.sender, commitment);
+        require(strategies[strategyId].firm == address(0), "exists");
+        strategies[strategyId] = StrategyInfo(msg.sender, true, uint64(block.number));
+        emit StrategyRegistered(msg.sender, strategyId, commitment);
+    }
+
+    /// @notice One-transaction onboarding: set the exposure cap and register the commitment.
+    function registerStrategyWithLimit(bytes32 commitment, uint256 maxNotional) external returns (bytes32) {
+        setRiskLimit(maxNotional);
+        return registerStrategy(commitment);
     }
 
     function setStrategyActive(bytes32 strategyId, bool active) external {
@@ -148,7 +166,7 @@ contract DarkPool is IDarkPoolBalances {
     }
 
     /// @notice Firm-controlled kill switch / exposure cap that the enclave cannot override.
-    function setRiskLimit(uint256 maxNotional) external {
+    function setRiskLimit(uint256 maxNotional) public {
         maxNotionalPerBatch[msg.sender] = maxNotional;
         emit RiskLimitSet(msg.sender, maxNotional);
     }

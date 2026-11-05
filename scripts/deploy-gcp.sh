@@ -59,6 +59,14 @@ gcloud run deploy "$SERVICE" --source "$ROOT" --project "$PROJECT" --region "$RE
   --set-env-vars "$ENV_VARS" \
   --set-secrets "MASTER_PK=vanta-master-pk:latest,ADMIN_TOKEN=vanta-admin-token:latest"
 
+# Old revisions keep their always-on CPU and background loops alive (a second engine, sim and
+# firm wallets in use). Only one enclave may run: delete every revision that is not serving.
+for r in $(gcloud run revisions list --service "$SERVICE" --project "$PROJECT" --region "$REGION" \
+    --filter="status.conditions.status!=True OR NOT status.conditions.type=Active" --format="value(name)"); do
+  [ "$r" = "$(gcloud run services describe "$SERVICE" --project "$PROJECT" --region "$REGION" --format='value(status.latestReadyRevisionName)')" ] && continue
+  gcloud run revisions delete "$r" --project "$PROJECT" --region "$REGION" --quiet >/dev/null && echo "  deleted old revision $r"
+done
+
 URL=$(gcloud run services describe "$SERVICE" --project "$PROJECT" --region "$REGION" --format='value(status.url)')
 echo
 echo "public dashboard : $URL"

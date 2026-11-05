@@ -10,7 +10,7 @@ engine/node_modules/
 contracts/lib/
 contracts/cache/
 contracts/broadcast/
-contracts/src/
+contracts/src/mocks/
 contracts/test/
 contracts/script/
 docs/

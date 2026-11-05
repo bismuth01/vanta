@@ -3,10 +3,12 @@
 // Monad receipts.
 //   NETWORK=testnet node src/deploy.ts         → plan + balance only
 //   NETWORK=testnet node src/deploy.ts --yes   → deploy, write deployments/<chainId>.json
-import { writeFileSync } from 'node:fs'
+//   NETWORK=testnet node src/deploy.ts --yes --pool-only
+//       → redeploy only DarkPool against the existing tokens/oracle/AMM/registry
+import { existsSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { formatEther, parseEther, type Abi, type Hex } from 'viem'
-import { address, artifact, CHAIN_ID, clients, KEYS, NETWORK, POLL_MS, requireKey, ROOT } from './config.ts'
+import { address, artifact, CHAIN_ID, clients, KEYS, NETWORK, POLL_MS, requireKey, retrying, ROOT } from './config.ts'
 
 const INITIAL_PRICE = parseEther(process.env.INITIAL_PRICE ?? '3')
 const LIQ_BASE = parseEther('1000000')
@@ -31,13 +33,24 @@ const wait = async (hash: Hex) => {
 }
 async function deploy(file: string, args: unknown[] = []) {
   const a = artifact(file)
-  const hash = await w.deployContract({ abi: a.abi, bytecode: a.bytecode, args } as never)
+  const hash = await retrying(() => w.deployContract({ abi: a.abi, bytecode: a.bytecode, args } as never))
   const r = await wait(hash)
   console.log(`  ${file.replace('.sol', '').padEnd(16)} ${r.contractAddress}`)
   return r
 }
 const call = async (to: Hex, abi: Abi, functionName: string, args: unknown[]) =>
-  wait(await w.writeContract({ address: to, abi, functionName, args } as never))
+  wait(await retrying(() => w.writeContract({ address: to, abi, functionName, args } as never)))
+
+const path = join(ROOT, 'deployments', `${CHAIN_ID}.json`)
+if (process.argv.includes('--pool-only')) {
+  if (!existsSync(path)) throw new Error(`--pool-only needs an existing ${path}`)
+  const prev = JSON.parse(readFileSync(path, 'utf8'))
+  const r = await deploy('DarkPool.sol', [prev.base, prev.quote, prev.oracle, prev.amm, prev.registry])
+  const next = { ...prev, pool: r.contractAddress!, poolDeployBlock: Number(r.blockNumber), previousPool: prev.pool }
+  writeFileSync(path, JSON.stringify(next, null, 2) + '\n')
+  console.log(`DarkPool redeployed → ${next.pool} (was ${prev.pool}); ${path} updated`)
+  process.exit(0)
+}
 
 const erc20 = artifact('MockERC20.sol').abi
 const baseR = await deploy('MockERC20.sol', ['Wrapped MON', 'WMON'])
@@ -57,7 +70,6 @@ await call(quote, erc20, 'approve', [amm, LIQ_QUOTE])
 await call(amm, artifact('SimpleAMM.sol').abi, 'addLiquidity', [LIQ_BASE, LIQ_QUOTE])
 
 const out = { chainId: CHAIN_ID, deployBlock: Number(baseR.blockNumber), base, quote, oracle, amm, registry, pool }
-const path = join(ROOT, 'deployments', `${CHAIN_ID}.json`)
 writeFileSync(path, JSON.stringify(out, null, 2) + '\n')
 console.log(`deployed → ${path}`)
 console.log(`deployer balance now ${formatEther(await pub.getBalance({ address: w.account.address }))} MON`)

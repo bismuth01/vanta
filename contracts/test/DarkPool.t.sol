@@ -10,6 +10,8 @@ import {SimpleAMM} from "../src/mocks/SimpleAMM.sol";
 import {Context, Order} from "../src/interfaces/IStrategy.sol";
 import {SlicedStopLoss} from "../src/strategies/SlicedStopLoss.sol";
 import {EmaDipBuyer} from "../src/strategies/EmaDipBuyer.sol";
+import {Evaluator} from "../src/engine/Evaluator.sol";
+import {RangeLiquidityProvider} from "../src/strategies/RangeLiquidityProvider.sol";
 
 contract DarkPoolTest is Test {
     MockERC20 wmon;
@@ -24,8 +26,10 @@ contract DarkPoolTest is Test {
     address enclave;
     address firmA = makeAddr("firmA");
     address firmB = makeAddr("firmB");
-    bytes32 constant STRAT_A = keccak256("A");
-    bytes32 constant STRAT_B = keccak256("B");
+    bytes32 constant COMMIT_A = keccak256("A");
+    bytes32 constant COMMIT_B = keccak256("B");
+    bytes32 STRAT_A;
+    bytes32 STRAT_B;
 
     uint256 constant PX = 3e18;
 
@@ -48,8 +52,10 @@ contract DarkPoolTest is Test {
         bytes32 encKey = bytes32(uint256(0xC0FFEE));
         registry.registerEnclave(enclave, encKey, abi.encode(MEASUREMENT, keccak256(abi.encode(enclave, encKey))));
 
-        _fund(firmA, 10_000e18, 0, STRAT_A);
-        _fund(firmB, 0, 30_000e18, STRAT_B);
+        STRAT_A = pool.strategyIdOf(firmA, COMMIT_A);
+        STRAT_B = pool.strategyIdOf(firmB, COMMIT_B);
+        _fund(firmA, 10_000e18, 0, COMMIT_A);
+        _fund(firmB, 0, 30_000e18, COMMIT_B);
     }
 
     function _fund(address firm, uint256 baseAmt, uint256 quoteAmt, bytes32 strat) internal {
@@ -76,7 +82,7 @@ contract DarkPoolTest is Test {
         return abi.encodePacked(r, s, v);
     }
 
-    function _fills2(bool aBuy, uint256 aAmt, bool bBuy, uint256 bAmt) internal pure returns (DarkPool.Fill[] memory f) {
+    function _fills2(bool aBuy, uint256 aAmt, bool bBuy, uint256 bAmt) internal view returns (DarkPool.Fill[] memory f) {
         f = new DarkPool.Fill[](2);
         f[0] = DarkPool.Fill(STRAT_A, aBuy, aAmt);
         f[1] = DarkPool.Fill(STRAT_B, bBuy, bAmt);
@@ -168,6 +174,34 @@ contract DarkPoolTest is Test {
         pool.settle(b, sig);
     }
 
+    function test_registerStrategyWithLimit_oneTx() public {
+        address guest = makeAddr("guest");
+        vm.prank(guest);
+        bytes32 id = pool.registerStrategyWithLimit(keccak256("guest-code"), 5_000e18);
+        (address owner, bool active,) = pool.strategies(id);
+        assertEq(owner, guest);
+        assertTrue(active);
+        assertEq(pool.maxNotionalPerBatch(guest), 5_000e18);
+        assertEq(id, pool.strategyIdOf(guest, keccak256("guest-code")));
+    }
+
+    function test_sameCommitment_differentFirms_noSquatting() public {
+        address other = makeAddr("other");
+        vm.prank(other);
+        bytes32 id = pool.registerStrategy(COMMIT_A); // same hash as firm A's: allowed, distinct id
+        assertTrue(id != STRAT_A);
+        (address ownerA,,) = pool.strategies(STRAT_A);
+        assertEq(ownerA, firmA);
+    }
+
+    function test_depositFor_creditsTargetFirm() public {
+        address guest = makeAddr("guest");
+        usdc.mint(address(this), 1_000e18);
+        usdc.approve(address(pool), 1_000e18);
+        pool.depositFor(guest, address(usdc), 1_000e18);
+        assertEq(pool.balanceOf(guest, address(usdc)), 1_000e18);
+    }
+
     // ── sealed strategies: injected with vm.etch, exactly like the engine's eth_call state override ──
     function _ctx(address firm) internal view returns (Context memory) {
         return Context(block.number, block.timestamp, firm, address(pool), address(oracle), address(amm), address(wmon), address(usdc));
@@ -203,4 +237,59 @@ contract DarkPoolTest is Test {
         assertTrue(o.isBuy);
         assertEq(o.baseAmount, 1_500e18);
     }
+}
+
+contract Looper {
+    function check(Context calldata, bytes calldata) external pure returns (Order memory, bytes memory) {
+        for (;;) {}
+    }
+}
+
+contract EvaluatorTest is Test {
+    function test_gasCapIsolatesRunawayStrategy() public {
+        Evaluator ev = new Evaluator();
+        MockOracle oracle = new MockOracle(address(this), 3e18);
+        Evaluator.Call[] memory calls = new Evaluator.Call[](2);
+        calls[0] = Evaluator.Call(address(new Looper()), 200_000, abi.encodeWithSelector(Looper.check.selector));
+        calls[1] = Evaluator.Call(address(oracle), 50_000, abi.encodeWithSelector(MockOracle.latest.selector));
+        Evaluator.Result[] memory r = ev.run(calls);
+        assertFalse(r[0].success, "runaway strategy fails");
+        assertTrue(r[1].success, "others still run");
+        (uint256 px,) = abi.decode(r[1].data, (uint256, uint256));
+        assertEq(px, 3e18);
+    }
+}
+
+contract RangeLiquidityProviderTest is Test {
+    function test_buysDip_sellsRip_withEmptyInitialState() public {
+        MockOracle oracle = new MockOracle(address(this), 3e18);
+        MockBalances bal = new MockBalances();
+        address phantom = address(0x5EA1ED);
+        vm.etch(phantom, address(new RangeLiquidityProvider()).code);
+        Context memory ctx = Context(100, 0, address(1), address(bal), address(oracle), address(0), address(2), address(3));
+        bal.set(address(2), 10_000e18);
+        bal.set(address(3), 30_000e18);
+
+        (Order memory o, bytes memory s) = RangeLiquidityProvider(phantom).check(ctx, "");
+        assertEq(o.baseAmount, 0, "idle inside the range");
+
+        oracle.set(2.80e18);
+        (o, s) = RangeLiquidityProvider(phantom).check(ctx, "");
+        assertTrue(o.isBuy);
+        assertEq(o.baseAmount, 800e18);
+        (o,) = RangeLiquidityProvider(phantom).check(ctx, s);
+        assertEq(o.baseAmount, 0, "cooldown in the same block");
+
+        oracle.set(3.30e18);
+        ctx.blockNumber = 101;
+        (o,) = RangeLiquidityProvider(phantom).check(ctx, s);
+        assertFalse(o.isBuy);
+        assertEq(o.baseAmount, 800e18);
+    }
+}
+
+contract MockBalances {
+    mapping(address => uint256) internal b;
+    function set(address token, uint256 v) external { b[token] = v; }
+    function balanceOf(address, address token) external view returns (uint256) { return b[token]; }
 }

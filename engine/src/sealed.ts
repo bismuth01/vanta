@@ -9,10 +9,15 @@ export type StrategyPayload = {
   initState: Hex // abi-encoded parameters = private initial state
 }
 
-/// strategyId registered on-chain. It binds the exact code + parameters without revealing them.
+/// Commitment registered on-chain. It binds the exact code + parameters without revealing them.
 export function commitment(code: Hex, initState: Hex): Hex {
   return keccak256(encodeAbiParameters([{ type: 'bytes' }, { type: 'bytes' }], [code, initState]))
 }
 
 export const encodePayload = (p: StrategyPayload) => Buffer.from(JSON.stringify(p))
 export const decodePayload = (b: Buffer) => JSON.parse(b.toString('utf8')) as StrategyPayload
+
+/// DarkPool.strategyIdOf(firm, commitment): ids are bound to the registering firm.
+export function strategyIdOf(firm: Hex, c: Hex): Hex {
+  return keccak256(encodeAbiParameters([{ type: 'address' }, { type: 'bytes32' }], [firm, c]))
+}

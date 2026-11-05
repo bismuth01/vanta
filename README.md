@@ -6,6 +6,8 @@ MEV bots can't front-run a trigger they can't read, and they can't sandwich a tr
 
 ![dashboard](docs/dashboard.png)
 
+**Demo:** the hosted hackathon deployment is closed; [DEPLOY.md](DEPLOY.md) shows how to run your own. In the app, click **＋ Bring your strategy** to compile, seal and run your own Solidity strategy from the browser. The presenter script is in [docs/DEMO.md](docs/DEMO.md).
+
 ## Why
 
 On a public chain, a "conditional order" contract publishes its own alpha:
@@ -107,7 +109,7 @@ cd .. && GCP_PROJECT=<id> ./scripts/deploy-gcp.sh        # Cloud Run, 1 always-o
 - **One `eth_call` per block.** Oracle, AMM and all strategies go through Multicall3, so the engine stays under the public RPC's rate limit.
 - **Block updates over websockets.**
 - **Re-onboards the demo firms on every boot.** Enclave keys are fresh each boot.
-- **Spends MON only on demand.** The market scenario starts only from the dashboard's **Run market scenario** button, shown when you open `/?admin=<ADMIN_TOKEN>`. One cycle costs ≈ 2.5–3 MON.
+- **Spends MON only on demand.** The market scenario starts only from the dashboard's **Run market scenario** button, shown when you open `/?admin=<ADMIN_TOKEN>`. One cycle costs ≈ 4–5 MON on testnet (relayer ≈ 2.5, sim ≈ 2); top up with `fund.ts`.
 
 **Where secrets live:** keys and the admin token go to Secret Manager and are never put in the image.
 

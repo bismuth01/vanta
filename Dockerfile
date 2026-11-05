@@ -8,6 +8,8 @@ COPY engine/src engine/src
 COPY dashboard dashboard
 COPY deployments deployments
 COPY contracts/out contracts/out
+# Solidity SDK served to the in-browser compiler (/sdk/*)
+COPY contracts/src contracts/src
 ENV NETWORK=testnet \
     PORT=8080 \
     NODE_ENV=production

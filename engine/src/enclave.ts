@@ -24,8 +24,7 @@ import {
 } from 'viem'
 import { generatePrivateKey, privateKeyToAccount } from 'viem/accounts'
 import { generateEncryptionKey, open, rawPublicKey } from './crypto.ts'
-import { commitment, decodePayload } from './sealed.ts'
-import { MULTICALL3, MULTICALL3_CODE } from './multicall3.ts'
+import { commitment, decodePayload, strategyIdOf } from './sealed.ts'
 
 export type Fill = { strategyId: Hex; isBuy: boolean; baseAmount: bigint }
 export type Batch = { batchId: bigint; validUntilBlock: bigint; price: bigint; fills: Fill[] }
@@ -38,17 +37,24 @@ export type SealedStrategy = {
   contract: string
   code: Hex
   state: Hex
+  initState: Hex
   phantom: Hex
   codeSize: number
   sealedSize: number
   fired: number
   lastMs: number
+  lastGas: number
+  guest: boolean
+  fillsLeft: number // guest budget (Infinity for house firms)
+  expiresAt: number // ms epoch (Infinity for house firms)
+  addedAt: number
 }
 
 export type EvalResult = {
   id: Hex
   order: { isBuy: boolean; baseAmount: bigint } | null
   ms: number
+  gas: number
   batched: boolean
   error?: string
 }
@@ -56,29 +62,35 @@ export type EvalResult = {
 /// Extra plain reads (oracle, AMM…) that ride along in the same eth_call as the strategies.
 export type Read = { target: Hex; callData: Hex }
 
-const AGGREGATE3_ABI = [
+/// Gas cap per strategy evaluation: a runaway guest strategy fails alone.
+export const STRATEGY_GAS = 1_500_000n
+const READ_GAS = 100_000n
+const EVALUATOR = '0x00000000000000000000000000000000e7a1e7a1' as const
+
+const EVALUATOR_ABI = [
   {
     type: 'function',
-    name: 'aggregate3',
-    stateMutability: 'payable',
+    name: 'run',
+    stateMutability: 'nonpayable',
     inputs: [
       {
         name: 'calls',
         type: 'tuple[]',
         components: [
           { name: 'target', type: 'address' },
-          { name: 'allowFailure', type: 'bool' },
-          { name: 'callData', type: 'bytes' },
+          { name: 'gasLimit', type: 'uint256' },
+          { name: 'data', type: 'bytes' },
         ],
       },
     ],
     outputs: [
       {
-        name: 'returnData',
+        name: 'results',
         type: 'tuple[]',
         components: [
           { name: 'success', type: 'bool' },
-          { name: 'returnData', type: 'bytes' },
+          { name: 'gasUsed', type: 'uint256' },
+          { name: 'data', type: 'bytes' },
         ],
       },
     ],
@@ -111,9 +123,12 @@ export class Enclave {
   private readonly encKeys = generateEncryptionKey()
   private readonly encPubRaw: Buffer
   private readonly strategyAbi: Abi
+  private readonly evaluatorCode: Hex
+  private slots = 0
 
-  constructor(strategyAbi: Abi) {
+  constructor(strategyAbi: Abi, evaluatorCode: Hex) {
     this.strategyAbi = strategyAbi
+    this.evaluatorCode = evaluatorCode
     this.signer = privateKeyToAccount(generatePrivateKey())
     this.encPubRaw = rawPublicKey(this.encKeys.publicKey)
     this.encryptionKey = toHex(this.encPubRaw)
@@ -132,40 +147,73 @@ export class Enclave {
     return encodeAbiParameters([{ type: 'bytes32' }, { type: 'bytes32' }], [this.measurement, reportData])
   }
 
-  /// Accept a sealed strategy. `onchainOwner` comes from DarkPool.strategies(id).
-  ingest(id: Hex, onchainOwner: Hex, sealedB64: string): SealedStrategy {
+  /// Decrypt and verify a sealed strategy against its on-chain id. Does not store it.
+  open(id: Hex, onchainOwner: Hex, sealedB64: string) {
     const sealed = Buffer.from(sealedB64, 'base64')
     const payload = decodePayload(open(this.encKeys.privateKey, this.encPubRaw, sealed))
-    if (commitment(payload.code, payload.initState) !== id) throw new Error('commitment mismatch')
+    if (!/^0x[0-9a-fA-F]*$/.test(payload.code) || !/^0x[0-9a-fA-F]*$/.test(payload.initState)) throw new Error('malformed payload')
+    if (strategyIdOf(onchainOwner, commitment(payload.code, payload.initState)) !== id) throw new Error('commitment mismatch')
+    return { payload, sealedSize: sealed.length }
+  }
+
+  /// Store an opened strategy. Re-sealing an existing id keeps its slot and resets private state.
+  add(
+    id: Hex,
+    onchainOwner: Hex,
+    opened: ReturnType<Enclave['open']>,
+    policy: { guest: boolean; fillsLeft: number; expiresAt: number },
+  ): SealedStrategy {
+    const { payload, sealedSize } = opened
     const existing = this.strategies.get(id)
     if (existing) {
-      // Re-seal (new enclave key or scenario replay): keep the slot, reset private state.
       existing.state = payload.initState
-      existing.sealedSize = sealed.length
+      existing.sealedSize = sealedSize
       return existing
     }
-    const idx = this.strategies.size + 1
     const s: SealedStrategy = {
       id,
       firm: onchainOwner,
-      firmName: payload.firmName,
-      label: payload.label,
-      contract: payload.contract,
+      firmName: payload.firmName.slice(0, 40),
+      label: payload.label.slice(0, 120),
+      contract: payload.contract.slice(0, 40),
       code: payload.code,
       state: payload.initState,
-      phantom: pad(toHex(0x5ea1ed0000 + idx), { size: 20 }),
+      initState: payload.initState,
+      phantom: pad(toHex(0x5ea1ed0000 + ++this.slots), { size: 20 }),
       codeSize: (payload.code.length - 2) / 2,
-      sealedSize: sealed.length,
+      sealedSize,
       fired: 0,
       lastMs: 0,
+      lastGas: 0,
+      addedAt: Date.now(),
+      ...policy,
     }
     this.strategies.set(id, s)
     return s
   }
 
+  remove(id: Hex) {
+    this.strategies.delete(id)
+  }
+
+  /// Dry-run one opened strategy before accepting it (guest uploads).
+  async probe(sim: PublicClient, code: Hex, state: Hex, ctx: Record<string, unknown>) {
+    const phantom = pad(toHex(0x5ea1edffff), { size: 20 })
+    const { data } = await sim.call({
+      to: phantom,
+      gas: STRATEGY_GAS,
+      data: encodeFunctionData({ abi: this.strategyAbi, functionName: 'check', args: [ctx, state] }),
+      stateOverride: [{ address: phantom, code }],
+    })
+    return decodeFunctionResult({ abi: this.strategyAbi, functionName: 'check', data: data! }) as unknown as [
+      { isBuy: boolean; baseAmount: bigint },
+      Hex,
+    ]
+  }
+
   /// Run every sealed strategy (plus `reads`) against the state at `blockNumber`.
-  ///   parallel:  one eth_call per strategy → per-strategy timings
-  ///   multicall: everything in ONE eth_call via Multicall3 → fits public-RPC rate limits
+  ///   parallel:  one eth_call per strategy → per-strategy wall-clock timings (local demo)
+  ///   multicall: everything in ONE eth_call through the gas-capped Evaluator → fits public RPCs
   async evaluate(
     sim: PublicClient,
     blockNumber: bigint,
@@ -180,22 +228,24 @@ export class Enclave {
     if (mode === 'multicall') {
       const t0 = performance.now()
       const calls = [
-        ...reads.map((r) => ({ target: r.target, allowFailure: true, callData: r.callData })),
-        ...all.map((s) => ({ target: s.phantom, allowFailure: true, callData: checkData(s) })),
+        ...reads.map((r) => ({ target: r.target, gasLimit: READ_GAS, data: r.callData })),
+        ...all.map((s) => ({ target: s.phantom, gasLimit: STRATEGY_GAS, data: checkData(s) })),
       ]
       const { data } = await sim.call({
-        to: MULTICALL3,
-        data: encodeFunctionData({ abi: AGGREGATE3_ABI, functionName: 'aggregate3', args: [calls] }),
+        to: EVALUATOR,
+        data: encodeFunctionData({ abi: EVALUATOR_ABI, functionName: 'run', args: [calls] }),
         blockNumber,
-        stateOverride: [{ address: MULTICALL3, code: MULTICALL3_CODE }, ...all.map((s) => ({ address: s.phantom, code: s.code }))],
+        stateOverride: [{ address: EVALUATOR, code: this.evaluatorCode }, ...all.map((s) => ({ address: s.phantom, code: s.code }))],
       })
-      const out = decodeFunctionResult({ abi: AGGREGATE3_ABI, functionName: 'aggregate3', data: data! })
+      const out = decodeFunctionResult({ abi: EVALUATOR_ABI, functionName: 'run', data: data! })
       const ms = performance.now() - t0
       const results = all.map((s, i) => {
         const r = out[reads.length + i]
-        return r.success ? this.apply(s, r.returnData, ms, true) : this.failed(s, ms, true, 'strategy reverted')
+        const gas = Number(r.gasUsed)
+        if (!r.success) return this.failed(s, ms, gas, true, gas >= Number(STRATEGY_GAS) - 50_000 ? 'out of gas (1.5M cap)' : 'strategy reverted')
+        return this.apply(s, r.data, ms, gas, true)
       })
-      return { results, reads: out.slice(0, reads.length).map((r) => (r.success ? r.returnData : null)) }
+      return { results, reads: out.slice(0, reads.length).map((r) => (r.success ? r.data : null)) }
     }
 
     const readsP = Promise.all(
@@ -212,35 +262,42 @@ export class Enclave {
         try {
           const { data } = await sim.call({
             to: s.phantom,
+            gas: STRATEGY_GAS,
             data: checkData(s),
             blockNumber,
             stateOverride: [{ address: s.phantom, code: s.code }],
           })
-          return this.apply(s, data!, performance.now() - t0, false)
+          return this.apply(s, data!, performance.now() - t0, 0, false)
         } catch (e) {
-          return this.failed(s, performance.now() - t0, false, (e as Error).message.split('\n')[0])
+          return this.failed(s, performance.now() - t0, 0, false, (e as Error).message.split('\n')[0])
         }
       }),
     )
     return { results, reads: await readsP }
   }
 
-  private apply(s: SealedStrategy, data: Hex, ms: number, batched: boolean): EvalResult {
-    const [order, newState] = decodeFunctionResult({
-      abi: this.strategyAbi,
-      functionName: 'check',
-      data,
-    }) as unknown as [{ isBuy: boolean; baseAmount: bigint }, Hex]
-    s.state = newState // private memory, never leaves the enclave
-    s.lastMs = ms
-    const fired = order.baseAmount > 0n
-    if (fired) s.fired++
-    return { id: s.id, order: fired ? order : null, ms, batched }
+  private apply(s: SealedStrategy, data: Hex, ms: number, gas: number, batched: boolean): EvalResult {
+    try {
+      const [order, newState] = decodeFunctionResult({
+        abi: this.strategyAbi,
+        functionName: 'check',
+        data,
+      }) as unknown as [{ isBuy: boolean; baseAmount: bigint }, Hex]
+      s.state = newState // private memory, never leaves the enclave
+      s.lastMs = ms
+      s.lastGas = gas
+      const fired = order.baseAmount > 0n
+      if (fired) s.fired++
+      return { id: s.id, order: fired ? order : null, ms, gas, batched }
+    } catch {
+      return this.failed(s, ms, gas, batched, 'bad return data')
+    }
   }
 
-  private failed(s: SealedStrategy, ms: number, batched: boolean, error: string): EvalResult {
+  private failed(s: SealedStrategy, ms: number, gas: number, batched: boolean, error: string): EvalResult {
     s.lastMs = ms
-    return { id: s.id, order: null, ms, batched, error }
+    s.lastGas = gas
+    return { id: s.id, order: null, ms, gas, batched, error }
   }
 
   /// Must equal DarkPool.batchDigest(b) == keccak256(abi.encode(chainid, pool, b)).

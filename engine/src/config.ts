@@ -57,6 +57,34 @@ export const POLL_MS = Number(env('POLL_MS', IS_LOCAL ? '50' : '250'))
 export const EVAL_MODE = env('EVAL_MODE', IS_LOCAL ? 'parallel' : 'multicall') as 'parallel' | 'multicall'
 // Guards the endpoints that spend MON (scenario start, phase updates). Empty = open (local only).
 export const ADMIN_TOKEN = env('ADMIN_TOKEN', '')!
+// Batch validity window. Public-RPC round trips (eval → estimate → send → inclusion) take
+// ~1–2 s on testnet; an expired batch still pays its full gas limit on Monad.
+// RPC the *browser* uses (never a private provider URL with an API key in it).
+export const PUBLIC_RPC_URL = env('PUBLIC_RPC_URL', preset.rpc)!
+// Guest ("bring your own strategy") policy: every guest fill spends relayer MON.
+export const GUEST = {
+  max: Number(env('GUEST_MAX', '6')), // concurrent guest strategies
+  fills: Number(env('GUEST_FILLS', '300')), // fills per guest strategy
+  ttlMin: Number(env('GUEST_TTL_MIN', '120')),
+  faucetMax: Number(env('FAUCET_MAX', '40')), // vault credits in total
+  faucetBase: env('FAUCET_BASE', '10000')!, // WMON credited to the guest vault
+  faucetQuote: env('FAUCET_QUOTE', '30000')!, // USDC credited to the guest vault
+  dripMon: env('DRIP_MON', '0.15')!, // gas money for burner wallets with < 0.05 MON
+  dripMax: Number(env('DRIP_MAX', '25')),
+}
+// Settle once every N blocks (a ~1 s batch auction on testnet).
+export const BATCH_EVERY_BLOCKS = BigInt(env('BATCH_EVERY_BLOCKS', IS_LOCAL ? '1' : '8')!)
+// Hosted: the market never idles (scenario cycles repeat until an admin pauses them).
+// Market loop keeps the relayer + sim wallets funded from the master wallet.
+export const TOPUP = {
+  below: env('TOPUP_BELOW', '1')!,
+  amount: env('TOPUP_AMOUNT', '2')!,
+  firmBelow: env('TOPUP_FIRM_BELOW', '0.1')!,
+  firmAmount: env('TOPUP_FIRM_AMOUNT', '0.3')!,
+  masterFloor: env('TOPUP_MASTER_FLOOR', '3')!, // loop pauses itself below this
+}
+export const MARKET_LOOP = (env('MARKET_LOOP', IS_LOCAL ? '0' : '1') ?? '0') === '1'
+export const VALID_FOR_BLOCKS = BigInt(env('VALID_FOR_BLOCKS', IS_LOCAL ? '3' : '12')!)
 
 // Anvil's well-known dev keys.
 const ANVIL_KEYS: Hex[] = [
@@ -92,6 +120,20 @@ export function requireKey(pk: Hex | undefined, what: string): Hex {
 }
 
 export const address = (pk: Hex) => privateKeyToAccount(pk).address
+
+/// Public Monad RPCs are load-balanced: right after a receipt, the next eth_estimateGas can land
+/// on a node a block behind and revert spuriously (e.g. an approve not yet visible). Retry.
+/// viem's nonce manager resets on a failed send, so retries don't leave nonce gaps.
+export async function retrying<T>(fn: () => Promise<T>, tries = 5, delayMs = 600): Promise<T> {
+  for (let i = 1; ; i++) {
+    try {
+      return await fn()
+    } catch (e) {
+      if (i >= tries) throw e
+      await new Promise((r) => setTimeout(r, delayMs * i))
+    }
+  }
+}
 
 export function loadDeployment() {
   const path = join(ROOT, 'deployments', `${CHAIN_ID}.json`)

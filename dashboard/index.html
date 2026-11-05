@@ -24,6 +24,7 @@
         <span class="pill phase" id="phase">market idle</span>
         <span class="pill conn" id="conn"><span class="dot"></span> live</span>
         <button class="pill run" id="run-scenario" hidden>▶ Run market scenario</button>
+        <button class="pill byos-btn" id="open-byos">＋ Bring your strategy</button>
       </div>
     </header>
 
@@ -130,6 +131,82 @@
       <code>eth_call</code> + state override against live Monad state, settled atomically by <code>DarkPool.settle()</code>.
     </footer>
 
+    <aside class="drawer" id="byos" hidden aria-label="Bring your own strategy">
+      <div class="drawer-head">
+        <div>
+          <h2>Bring your own strategy</h2>
+          <p class="hint">Write Solidity, compile it in your browser, seal it to the attested enclave and go live with one transaction. Your code is never deployed and never leaves this page unencrypted.</p>
+        </div>
+        <button class="ghost" id="byos-close" aria-label="Close">✕</button>
+      </div>
+
+      <section class="byos-step">
+        <h3><span class="num">1</span> Connect a wallet</h3>
+        <div class="row">
+          <button class="primary" id="byos-connect">Connect browser wallet</button>
+          <button class="ghost" id="byos-burner">No wallet? Use a burner</button>
+        </div>
+        <div class="byos-status" id="byos-wallet-status" hidden></div>
+      </section>
+
+      <section class="byos-step">
+        <h3><span class="num">2</span> Fund your dark-pool vault</h3>
+        <div class="row">
+          <button class="primary byos-needs-wallet" id="byos-faucet" disabled>Get demo funds (free)</button>
+          <span class="muted small">Vault: <b id="byos-vault">—</b></span>
+        </div>
+        <div class="byos-status" id="byos-faucet-status" hidden></div>
+        <label class="inline">Risk limit per batch (USDC, enforced by the contract) <input id="byos-limit" type="number" min="1" value="10000" /></label>
+      </section>
+
+      <section class="byos-step">
+        <h3><span class="num">3</span> Write your strategy</h3>
+        <div class="row">
+          <label>Template
+            <select id="byos-template">
+              <option value="range">Range Liquidity Provider (demo)</option>
+              <option value="nibbler">Minimal: dip nibbler</option>
+            </select>
+          </label>
+          <label>Desk name <input id="byos-desk" maxlength="40" value="Your Desk" /></label>
+        </div>
+        <textarea id="byos-code" spellcheck="false" autocomplete="off" aria-label="Strategy source"></textarea>
+        <details>
+          <summary>Advanced</summary>
+          <label>Label (private, shown only inside the enclave view) <input id="byos-label" maxlength="120" /></label>
+          <label>Initial private state (ABI-encoded hex, optional) <input id="byos-state" placeholder="0x" /></label>
+        </details>
+        <div class="row">
+          <button class="primary" id="byos-compile">Compile in browser</button>
+          <button class="ghost" id="byos-dryrun" disabled>Dry-run on live Monad</button>
+        </div>
+        <div class="byos-status" id="byos-compile-status" hidden></div>
+        <div class="byos-status" id="byos-dryrun-status" hidden></div>
+      </section>
+
+      <section class="byos-step">
+        <h3><span class="num">4</span> Seal &amp; go live</h3>
+        <button class="primary" id="byos-seal" disabled>Seal &amp; register (1 transaction)</button>
+        <ol class="byos-steps" id="byos-seal-steps" hidden></ol>
+        <p class="muted small" id="byos-guest-policy"></p>
+      </section>
+
+      <section class="byos-step live" id="byos-live" hidden>
+        <h3><span class="num">●</span> Live in the enclave</h3>
+        <dl class="byos-kv">
+          <div><dt>Strategy id</dt><dd class="mono" id="byos-live-id">—</dd></div>
+          <div><dt>Last evaluation</dt><dd id="byos-live-last">waiting for next block…</dd></div>
+          <div><dt>Budget</dt><dd id="byos-live-budget">—</dd></div>
+          <div><dt>Vault</dt><dd id="byos-live-vault">—</dd></div>
+        </dl>
+        <p class="muted small" id="byos-live-note">Your card in "Inside the enclave" is tagged YOU. On-chain, MEV bots only see its hash.</p>
+        <h4>Your fills</h4>
+        <ul class="byos-fills" id="byos-live-fills"><li class="muted">none yet: fills appear when the market reaches your levels</li></ul>
+        <button class="ghost" id="byos-pause">Pause strategy (1 tx)</button>
+      </section>
+    </aside>
+
     <script type="module" src="/app.js"></script>
+    <script type="module" src="/byos.js"></script>
   </body>
 </html>

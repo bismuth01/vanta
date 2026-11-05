@@ -5,9 +5,18 @@
 //   3. register only the commitment hash on-chain
 //   4. hand the ciphertext to the engine
 import { encodeAbiParameters, parseUnits, type Hex } from 'viem'
-import { abis, artifact, clients, ENGINE_URL, KEYS, loadDeployment, POLL_MS, requireKey } from './config.ts'
+import { abis, artifact, clients, ENGINE_URL, KEYS, loadDeployment, POLL_MS, requireKey, retrying } from './config.ts'
 import { seal } from './crypto.ts'
-import { commitment, encodePayload, type StrategyPayload } from './sealed.ts'
+import { commitment, encodePayload, strategyIdOf, type StrategyPayload } from './sealed.ts'
+
+// One-line failure reason for the engine's market loop (instead of a full viem error dump).
+const fatal = (e: any) => {
+  if (process.env.DEBUG_FATAL) console.error(e)
+  console.error(`FATAL: ${(e?.shortMessage ?? e?.message ?? String(e)).split('\n')[0]}${e?.details ? ` (${String(e.details).slice(0, 160)})` : ''}`)
+  process.exit(1)
+}
+process.on('uncaughtException', fatal)
+process.on('unhandledRejection', fatal)
 
 const dep = loadDeployment()
 const { pub, wallet } = clients(dep.chainId)
@@ -93,7 +102,7 @@ async function onboard(f: FirmSetup, encKey: Buffer) {
   const w = wallet(requireKey(f.pk, f.name))
   const me = w.account.address
   const send = async (address: Hex, abi: typeof abis.pool, functionName: string, args: unknown[]) => {
-    const hash = await w.writeContract({ address, abi, functionName, args } as never)
+    const hash = await retrying(() => w.writeContract({ address, abi, functionName, args } as never))
     return pub.waitForTransactionReceipt({ hash, pollingInterval: POLL_MS })
   }
   const read = <T>(address: Hex, abi: typeof abis.pool, functionName: string, args: unknown[] = []) =>
@@ -122,9 +131,10 @@ async function onboard(f: FirmSetup, encKey: Buffer) {
 
   const code = artifact(`${f.contract}.sol`).runtime
   const payload: StrategyPayload = { firmName: f.name, label: f.label, contract: f.contract, code, initState: f.state }
-  const id = commitment(code, f.state)
+  const c = commitment(code, f.state)
+  const id = strategyIdOf(me, c)
   const [owner, active] = await read<[Hex, boolean, bigint]>(dep.pool, abis.pool, 'strategies', [id])
-  if (owner === '0x0000000000000000000000000000000000000000') await send(dep.pool, abis.pool, 'registerStrategy', [id])
+  if (owner === '0x0000000000000000000000000000000000000000') await send(dep.pool, abis.pool, 'registerStrategy', [c])
   else if (owner.toLowerCase() !== me.toLowerCase()) throw new Error(`${f.name}: commitment owned by ${owner}`)
   else if (!active) await send(dep.pool, abis.pool, 'setStrategyActive', [id, true])
 

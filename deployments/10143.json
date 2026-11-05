@@ -1,0 +1,12 @@
+{
+  "chainId": 10143,
+  "deployBlock": 76908487,
+  "base": "0xb15a83d1afd4ff0f1baf8c99560208d2e76fa714",
+  "quote": "0xf9691e716d67987b909a63ec2c67839531a29e7d",
+  "oracle": "0x0b7cf9ed16b5fc7e973d6ac83e12e068201149d8",
+  "amm": "0x946e944793c293b7616e382c148bac48c367c3d5",
+  "registry": "0xcae4727efbb1163ff50d75a206b3bf714eab31d8",
+  "pool": "0x10926c1a51542ff967f2b9fe5b03b838c4e44eb0",
+  "poolDeployBlock": 76916030,
+  "previousPool": "0xca98cf0829ca9bfc70a0ad30389ef93a06562fb7"
+}

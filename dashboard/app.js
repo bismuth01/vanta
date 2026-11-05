@@ -57,6 +57,7 @@ function connect() {
   ws.onmessage = (ev) => {
     const { type, data } = JSON.parse(ev.data)
     handlers[type]?.(data)
+    window.dispatchEvent(new CustomEvent('vanta:event', { detail: { type, data } }))
   }
 }
 
@@ -107,6 +108,7 @@ const handlers = {
       const s = state.strategies.get(r.id)
       if (s) {
         s.lastMs = r.ms
+        s.lastGas = r.gas
         state.batched = r.batched
         if (r.order) s.fired++
       }
@@ -128,6 +130,13 @@ const handlers = {
     renderMevLast(null, settlement)
     renderKpis()
     scheduleCharts()
+  },
+  strategyRemoved({ id }) {
+    state.strategies.delete(id)
+    state.results.delete(id)
+    renderStrategies()
+    renderCommitments()
+    renderKpis()
   },
   failed({ stats }) {
     state.stats = stats
@@ -160,14 +169,29 @@ const adminToken = () => sessionStorage.getItem('vanta-admin') ?? ''
 function renderScenario(sc) {
   const btn = $('run-scenario')
   const canRun = !state.adminRequired || !!adminToken()
+  state.scenario = sc
   btn.hidden = !canRun
-  btn.disabled = !!sc?.running
-  btn.textContent = sc?.running ? `⏳ ${sc.step}` : '▶ Run market scenario'
+  btn.disabled = !!sc?.running && !sc?.loop
+  btn.textContent = sc?.running ? (sc.loop ? '⏸ Pause market loop' : '⏳ finishing cycle…') : '▶ Start market loop'
+  btn.title = sc?.step ?? ''
+  // Make loop problems visible instead of a silent "market idle".
+  const phase = $('phase')
+  phase.classList.toggle('warn', !!sc?.error)
+  if (sc?.error) phase.textContent = `⚠ market: ${sc.step}`
+  else if (sc?.running && !/market running/.test(sc.step ?? '')) phase.textContent = `market: ${sc.step}`
 }
 
 $('run-scenario').addEventListener('click', async () => {
-  const res = await fetch('/api/scenario', { method: 'POST', headers: { 'x-admin-token': adminToken() } })
-  if (!res.ok) alert(`Could not start scenario: ${(await res.json()).error}`)
+  const sc = state.scenario
+  const action = sc?.running && sc?.loop ? 'pause' : 'loop'
+  const res = await fetch('/api/scenario', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-admin-token': adminToken() },
+    body: JSON.stringify({ action }),
+  })
+  const body = await res.json()
+  if (!res.ok) alert(`Could not ${action} the market: ${body.error}`)
+  else renderScenario(body)
 })
 
 function setPhase(p) {
@@ -222,12 +246,21 @@ function renderStrategies() {
       const order = r?.order
       return el(
         'div',
-        { class: `strat${order ? ' firing' : ''}` },
+        { class: `strat${order ? ' firing' : ''}${isMine(s) ? ' mine' : ''}` },
         el(
           'div',
           { class: 'row1' },
-          el('span', {}, el('span', { class: 'firm' }, s.firmName), ' ', el('span', { class: 'contract' }, s.contract)),
-          el('span', { class: `order${order ? '' : ' idle'}` }, order ? `${order.isBuy ? 'BUY' : 'SELL'} ${nf0.format(order.base)} MON` : 'idle'),
+          el(
+            'span',
+            {},
+            el('span', { class: 'firm' }, s.firmName),
+            ' ',
+            el('span', { class: 'contract' }, s.contract),
+            isMine(s) ? el('span', { class: 'tag you' }, 'YOU') : s.guest ? el('span', { class: 'tag guest' }, 'guest') : null,
+          ),
+          s.guest && s.fillsLeft === 0
+            ? el('span', { class: 'order idle' }, 'budget used up')
+            : el('span', { class: `order${order ? '' : ' idle'}` }, order ? `${order.isBuy ? 'BUY' : 'SELL'} ${nf0.format(order.base)} MON` : 'idle'),
         ),
         el('div', { class: 'label' }, s.label),
         el(
@@ -235,7 +268,8 @@ function renderStrategies() {
           { class: 'meta' },
           el('span', {}, `id ${short(s.id, 8, 4)}`),
           el('span', {}, `${nf0.format(s.codeSize)} B code`),
-          el('span', {}, state.batched ? `eval ${nf1.format(s.lastMs ?? 0)} ms (1 batched call)` : `eval ${nf1.format(s.lastMs ?? 0)} ms`),
+          el('span', {}, state.batched ? `gas ${nf0.format(s.lastGas ?? 0)} · ${nf1.format(s.lastMs ?? 0)} ms (1 batched call)` : `eval ${nf1.format(s.lastMs ?? 0)} ms`),
+          s.guest && s.fillsLeft != null ? el('span', {}, `${s.fillsLeft} fills left`) : null,
           el('span', {}, `fired ${nf0.format(s.fired)}×`),
         ),
         r?.error ? el('div', { class: 'err' }, `⚠ ${r.error}`) : null,
@@ -267,7 +301,7 @@ function renderMevLast(submitted, settled) {
   if (submitted) {
     box.replaceChildren(
       el('div', {}, 'Batch for block ', el('b', {}, nf0.format(submitted.n)), ' sent directly to the upcoming leaders: ', txLink(submitted.hash, 10, 6)),
-      el('div', { class: 'muted' }, `${submitted.calldataBytes} B calldata: strategy hashes + sizes, valid for 3 blocks only.`),
+      el('div', { class: 'muted' }, `${submitted.calldataBytes} B calldata: strategy hashes + sizes, valid for a few blocks only.`),
     )
     return
   }
@@ -293,7 +327,9 @@ function feedRow(s) {
     el(
       'td',
       {},
-      s.fills.map((f) => el('span', { class: 'chip' }, el('span', { class: 'side' }, f.isBuy ? 'B' : 'S'), ` ${firmShort(f.firmName)} ${nf0.format(f.base)}`)),
+      s.fills.map((f) =>
+        el('span', { class: `chip${window.vantaMe && f.firm?.toLowerCase() === window.vantaMe ? ' you' : ''}` }, el('span', { class: 'side' }, f.isBuy ? 'B' : 'S'), ` ${firmShort(f.firmName)} ${nf0.format(f.base)}`),
+      ),
       s.rejected.length ? el('span', { class: 'chip' }, `${s.rejected.length} rejected`) : null,
     ),
     el('td', { class: 'num' }, s.crossed > 0 ? el('b', {}, nf0.format(s.crossed)) : '0'),
@@ -506,6 +542,14 @@ $('toggle-table').addEventListener('click', (e) => {
   if (!wrap.hidden) renderTable()
 })
 window.addEventListener('resize', scheduleCharts)
+
+function isMine(s) {
+  return !!window.vantaMe && s.firm?.toLowerCase() === window.vantaMe
+}
+window.addEventListener('vanta:me', () => {
+  renderStrategies()
+  renderFeed(true)
+})
 
 renderKpis()
 renderStrategies()

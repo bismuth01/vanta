@@ -9,7 +9,7 @@ import { readFile } from 'node:fs/promises'
 import { join, extname } from 'node:path'
 import { timingSafeEqual } from 'node:crypto'
 import { WebSocketServer } from 'ws'
-import { decodeFunctionResult, encodeFunctionData, formatUnits, parseEventLogs, type Hex } from 'viem'
+import { decodeFunctionResult, encodeFunctionData, formatUnits, isAddress, parseEther, parseEventLogs, type Hex } from 'viem'
 import {
   abis,
   address,
@@ -18,14 +18,21 @@ import {
   clients,
   ENGINE_PORT,
   EVAL_MODE,
+  BATCH_EVERY_BLOCKS,
   EXPLORER_URL,
+  GUEST,
+  MARKET_LOOP,
+  TOPUP,
+  PUBLIC_RPC_URL,
   IS_LOCAL,
   KEYS,
   loadDeployment,
   NETWORK,
   POLL_MS,
   requireKey,
+  retrying,
   ROOT,
+  VALID_FOR_BLOCKS,
 } from './config.ts'
 import { Enclave, type Batch, type EvalResult, type Read } from './enclave.ts'
 
@@ -33,14 +40,10 @@ const dep = loadDeployment()
 const { pub, sim, wsPub, wallet } = clients(dep.chainId)
 const owner = wallet(requireKey(KEYS.deployer, 'deployer'))
 const relayer = wallet(requireKey(KEYS.relayer, 'relayer'))
-const enclave = new Enclave(artifact('IStrategy.sol', 'IStrategy').abi)
+const enclave = new Enclave(artifact('IStrategy.sol', 'IStrategy').abi, artifact('Evaluator.sol').runtime)
 
-// Hosted: only the demo firms may hand strategies to this enclave (their batches spend relayer MON).
-const ALLOWED_FIRMS = new Set(
-  (process.env.ALLOWED_FIRMS?.split(',') ?? (IS_LOCAL ? [] : KEYS.firms.map((k) => address(requireKey(k, 'firm'))))).map((a) =>
-    a.trim().toLowerCase(),
-  ),
-)
+// House firms (the scripted demo) are unrestricted; every other wallet is a guest with a budget.
+const HOUSE_FIRMS = new Set(KEYS.firms.filter(Boolean).map((k) => address(k!).toLowerCase()))
 const AUTO_ONBOARD = (process.env.AUTO_ONBOARD ?? (IS_LOCAL ? '0' : '1')) === '1'
 
 const E18 = 10n ** 18n
@@ -66,7 +69,7 @@ const stats = {
 }
 let simPhase = 'idle'
 let attested = false
-const scenario = { running: false, step: 'idle', startedAt: 0 }
+const scenario = { running: false, loop: MARKET_LOOP, cycle: 0, step: 'idle', error: '', startedAt: 0 }
 
 // ───────────────────────────── websocket fan-out ─────────────────────────────
 const server = createServer(handleHttp)
@@ -89,7 +92,15 @@ function publicStrategy(s: ReturnType<typeof enclave.strategies.get> & {}) {
     sealedSize: s.sealedSize,
     fired: s.fired,
     lastMs: s.lastMs,
+    lastGas: s.lastGas,
+    guest: s.guest,
+    fillsLeft: Number.isFinite(s.fillsLeft) ? s.fillsLeft : null,
+    expiresAt: Number.isFinite(s.expiresAt) ? s.expiresAt : null,
   }
+}
+
+function ctxFor(firm: Hex, blockNumber: bigint, timestamp: bigint) {
+  return { blockNumber, timestamp, firm, pool: dep.pool, oracle: dep.oracle, amm: dep.amm, base: dep.base, quote: dep.quote }
 }
 
 function snapshot() {
@@ -145,24 +156,54 @@ function send(res: ServerResponse, status: number, payload: unknown) {
 async function handleHttp(req: IncomingMessage, res: ServerResponse) {
   const url = new URL(req.url ?? '/', 'http://x')
   try {
-    if (url.pathname === '/healthz') return send(res, 200, { ok: true, attested, blocks: stats.blocks })
+    if (url.pathname === '/health') return send(res, 200, { ok: true, attested, blocks: stats.blocks })
     if (url.pathname === '/api/enclave') return send(res, 200, snapshot().enclave)
+
+    if (url.pathname === '/api/config') return send(res, 200, publicConfig())
+
+    if (url.pathname.startsWith('/sdk/')) {
+      // Solidity SDK for the in-browser compiler (interfaces + base + templates).
+      const name = url.pathname.slice(5)
+      if (!SDK_FILES[name]) return send(res, 404, { error: 'unknown sdk file' })
+      res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8' })
+      return res.end(await readFile(join(ROOT, 'contracts', SDK_FILES[name])))
+    }
 
     if (url.pathname === '/api/strategies' && req.method === 'POST') {
       const { strategyId, sealed } = await body(req)
+      if (typeof strategyId !== 'string' || typeof sealed !== 'string' || sealed.length > 200_000) throw new Error('bad request')
       // The chain, not the uploader, says who owns this commitment.
-      const [firm, active] = (await pub.readContract({
-        address: dep.pool,
-        abi: abis.pool,
-        functionName: 'strategies',
-        args: [strategyId],
-      })) as [Hex, boolean, bigint]
-      if (firm === '0x0000000000000000000000000000000000000000' || !active) throw new Error('strategy not registered')
-      if (ALLOWED_FIRMS.size && !ALLOWED_FIRMS.has(firm.toLowerCase())) return send(res, 403, { error: 'firm not allowed on this demo' })
-      const s = enclave.ingest(strategyId, firm, sealed)
-      console.log(`🔒 sealed strategy ${strategyId.slice(0, 10)}… from ${s.firmName} (${s.sealedSize} B ciphertext)`)
+      const [firm, active] = (await retrying(() =>
+        pub.readContract({ address: dep.pool, abi: abis.pool, functionName: 'strategies', args: [strategyId] }),
+      )) as [Hex, boolean, bigint]
+      if (firm === '0x0000000000000000000000000000000000000000' || !active) throw new Error('strategy not registered on-chain (yet?)')
+      const guest = !HOUSE_FIRMS.has(firm.toLowerCase())
+      const opened = enclave.open(strategyId as Hex, firm, sealed)
+      if (guest) {
+        const guests = [...enclave.strategies.values()].filter((s) => s.guest && s.id !== strategyId)
+        if (guests.length >= GUEST.max) return send(res, 429, { error: `guest slots full (${GUEST.max}); try again later` })
+        // Dry-run before accepting: a guest strategy must at least execute.
+        const head = await pub.getBlock()
+        try {
+          await enclave.probe(sim, opened.payload.code, opened.payload.initState, ctxFor(firm, head.number!, head.timestamp))
+        } catch (e) {
+          return send(res, 422, { error: `strategy failed its dry-run: ${(e as Error).message.split('\n')[0]}` })
+        }
+      }
+      const s = enclave.add(strategyId as Hex, firm, opened, {
+        guest,
+        fillsLeft: guest ? GUEST.fills : Infinity,
+        expiresAt: guest ? Date.now() + GUEST.ttlMin * 60_000 : Infinity,
+      })
+      console.log(`🔒 sealed ${guest ? 'GUEST' : 'house'} strategy ${strategyId.slice(0, 10)}… from ${s.firmName} (${s.sealedSize} B ciphertext)`)
       broadcast('strategy', publicStrategy(s))
-      return send(res, 200, { ok: true })
+      return send(res, 200, { ok: true, strategy: publicStrategy(s) })
+    }
+
+    if (url.pathname === '/api/faucet' && req.method === 'POST') {
+      const { address: to } = await body(req)
+      if (typeof to !== 'string' || !isAddress(to)) throw new Error('bad address')
+      return send(res, 200, await faucet(to as Hex))
     }
 
     if (url.pathname === '/api/sim' && req.method === 'POST') {
@@ -175,8 +216,20 @@ async function handleHttp(req: IncomingMessage, res: ServerResponse) {
     if (url.pathname === '/api/scenario') {
       if (req.method !== 'POST') return send(res, 200, scenario)
       if (!isAdmin(req)) return send(res, 401, { error: 'admin token required' })
+      const { action = 'start' } = await body(req).catch(() => ({}))
+      if (action === 'pause') {
+        scenario.loop = false
+        setScenario(scenario.running ? 'pausing after this cycle' : 'paused')
+        return send(res, 200, scenario)
+      }
+      if (action === 'loop') {
+        scenario.loop = true
+        if (!scenario.running) void runMarket()
+        setScenario(scenario.running ? scenario.step : 'starting loop')
+        return send(res, 200, scenario)
+      }
       if (scenario.running) return send(res, 409, { error: 'scenario already running', scenario })
-      void runScenario()
+      void runMarket()
       return send(res, 202, scenario)
     }
 
@@ -190,6 +243,106 @@ async function handleHttp(req: IncomingMessage, res: ServerResponse) {
   }
 }
 
+// ───────────────────────────── bring-your-own-strategy support ─────────────────────────────
+const SDK_FILES: Record<string, string> = {
+  'IStrategy.sol': 'src/interfaces/IStrategy.sol',
+  'StrategyBase.sol': 'src/strategies/StrategyBase.sol',
+  'templates/RangeLiquidityProvider.sol': 'src/strategies/RangeLiquidityProvider.sol',
+  'templates/SlicedStopLoss.sol': 'src/strategies/SlicedStopLoss.sol',
+  'templates/MomentumBreakout.sol': 'src/strategies/MomentumBreakout.sol',
+}
+
+function publicConfig() {
+  return {
+    chainId: dep.chainId,
+    network: NETWORK,
+    rpcUrl: PUBLIC_RPC_URL,
+    explorer: EXPLORER_URL,
+    deployment: dep,
+    enclave: { signer: enclave.signer.address, registry: dep.registry },
+    guest: { max: GUEST.max, fills: GUEST.fills, ttlMin: GUEST.ttlMin, faucetBase: GUEST.faucetBase, faucetQuote: GUEST.faucetQuote },
+    abis: { pool: abis.pool, registry: abis.registry, strategy: abis.strategy, oracle: abis.oracle },
+  }
+}
+
+// Demo faucet: credits the guest's *vault* directly (DarkPool.depositFor), so the guest needs no
+// token transactions at all; burner wallets also get a little MON for their one registration tx.
+const faucetDone = new Set<string>()
+let faucetCount = 0
+let dripCount = 0
+let faucetQueue: Promise<unknown> = Promise.resolve()
+const faucetBase = parseEther(GUEST.faucetBase)
+const faucetQuote = parseEther(GUEST.faucetQuote)
+
+function faucet(to: Hex) {
+  const run = async () => {
+    const key = to.toLowerCase()
+    const result: { credited: boolean; dripped: boolean; txs: Hex[]; note?: string } = { credited: false, dripped: false, txs: [] }
+    const wait = (hash: Hex) => pub.waitForTransactionReceipt({ hash, pollingInterval: POLL_MS, timeout: 60_000 })
+    const write = async (address: Hex, abi: typeof abis.pool, functionName: string, args: unknown[]) => {
+      const hash = await retrying(() => owner.writeContract({ address, abi, functionName, args } as never))
+      result.txs.push(hash)
+      return wait(hash)
+    }
+
+    if (faucetDone.has(key)) result.note = 'vault already credited for this wallet'
+    else if (faucetCount >= GUEST.faucetMax) result.note = 'faucet exhausted'
+    else {
+      for (const [token, amount] of [
+        [dep.base, faucetBase],
+        [dep.quote, faucetQuote],
+      ] as const) {
+        const [bal, allowance] = (await Promise.all([
+          pub.readContract({ address: token, abi: abis.erc20, functionName: 'balanceOf', args: [owner.account.address] }),
+          pub.readContract({ address: token, abi: abis.erc20, functionName: 'allowance', args: [owner.account.address, dep.pool] }),
+        ])) as [bigint, bigint]
+        if (bal < amount) await write(token, abis.erc20, 'mint', [owner.account.address, amount * 100n])
+        if (allowance < amount) await write(token, abis.erc20, 'approve', [dep.pool, 2n ** 255n])
+        await write(dep.pool, abis.pool, 'depositFor', [to, token, amount])
+      }
+      faucetDone.add(key)
+      faucetCount++
+      result.credited = true
+    }
+
+    const mon = await pub.getBalance({ address: to })
+    if (mon < parseEther('0.05') && dripCount < GUEST.dripMax) {
+      const hash = await retrying(() => relayer.sendTransaction({ to, value: parseEther(GUEST.dripMon) }))
+      result.txs.push(hash)
+      await wait(hash)
+      dripCount++
+      result.dripped = true
+    }
+    console.log(`🚰 faucet ${to}: vault ${result.credited ? 'credited' : 'skipped'}${result.dripped ? ', dripped MON' : ''}`)
+    return result
+  }
+  const p = faucetQueue.then(run, run)
+  faucetQueue = p.catch(() => {})
+  return p
+}
+
+/// Guest budget + expiry. Returns the orders allowed into this batch.
+function applyGuestPolicy<T extends { id: Hex }>(orders: T[]): T[] {
+  const now = Date.now()
+  for (const s of [...enclave.strategies.values()]) {
+    if (s.guest && now > s.expiresAt) {
+      enclave.remove(s.id)
+      pending.delete(s.id)
+      broadcast('strategyRemoved', { id: s.id, reason: 'expired' })
+      console.log(`⌛ guest strategy ${s.id.slice(0, 10)}… expired`)
+    }
+  }
+  return orders.filter((o) => {
+    const s = enclave.strategies.get(o.id)
+    if (!s) return false
+    if (!s.guest) return true
+    if (s.fillsLeft <= 0) return false
+    s.fillsLeft--
+    broadcast('strategy', publicStrategy(s))
+    return true
+  })
+}
+
 // ───────────────────────────── child scripts (firms, market sim) ─────────────────────────────
 function runScript(script: string, extraEnv: Record<string, string> = {}): Promise<void> {
   return new Promise((resolve, reject) => {
@@ -200,7 +353,12 @@ function runScript(script: string, extraEnv: Record<string, string> = {}): Promi
     const tag = script.replace('.ts', '')
     child.stdout.on('data', (d) => process.stdout.write(String(d).replace(/^(?=.)/gm, `[${tag}] `)))
     child.stderr.on('data', (d) => process.stderr.write(String(d).replace(/^(?=.)/gm, `[${tag}] `)))
-    child.on('exit', (code) => (code === 0 ? resolve() : reject(new Error(`${script} exited with ${code}`))))
+    let fatal = ''
+    child.stderr.on('data', (d) => {
+      const m = String(d).match(/FATAL: (.*)/)
+      if (m) fatal = m[1]
+    })
+    child.on('exit', (code) => (code === 0 ? resolve() : reject(new Error(`${script.replace('.ts', '')}: ${fatal || `exited with ${code}`}`))))
   })
 }
 
@@ -210,18 +368,59 @@ function setScenario(step: string, running = scenario.running) {
   broadcast('scenario', scenario)
 }
 
-async function runScenario() {
-  scenario.startedAt = Date.now()
-  try {
-    setScenario('resetting firm balances', true)
-    await runScript('firms.ts')
-    setScenario('market running')
-    await runScript('sim.ts', { SIM_CYCLES: '1' })
-    setScenario('done', false)
-  } catch (e) {
-    console.error('scenario failed:', (e as Error).message)
-    setScenario(`failed: ${(e as Error).message}`, false)
+/// Keep the wallets that pay gas for the always-on market funded from the master wallet.
+async function topUpOperators() {
+  if (IS_LOCAL) return
+  const master = await pub.getBalance({ address: owner.account.address })
+  if (master < parseEther(TOPUP.masterFloor)) {
+    throw new Error(`master wallet low (${Number(formatUnits(master, 18)).toFixed(2)} MON < ${TOPUP.masterFloor}); fund ${owner.account.address}`)
   }
+  const wallets: [string, Hex | undefined, string, string][] = [
+    ['relayer', KEYS.relayer, TOPUP.below, TOPUP.amount],
+    ['sim', KEYS.sim, TOPUP.below, TOPUP.amount],
+    ...KEYS.firms.map((k, i) => [`firm${i + 1}`, k, TOPUP.firmBelow, TOPUP.firmAmount] as [string, Hex | undefined, string, string]),
+  ]
+  for (const [role, pk, below, amount] of wallets) {
+    const to = address(requireKey(pk, role))
+    const bal = await pub.getBalance({ address: to })
+    if (bal >= parseEther(below)) continue
+    const hash = await retrying(() => owner.sendTransaction({ to, value: parseEther(amount) }))
+    await pub.waitForTransactionReceipt({ hash, pollingInterval: POLL_MS })
+    console.log(`⛽ topped up ${role} with ${amount} MON`)
+  }
+}
+
+/// One scenario cycle = reset house-firm balances + one scripted market cycle.
+/// With scenario.loop the market never idles: cycles repeat until paused.
+async function runMarket() {
+  scenario.startedAt = Date.now()
+  scenario.running = true
+  scenario.error = ''
+  let failures = 0
+  do {
+    scenario.cycle++
+    try {
+      setScenario(`cycle ${scenario.cycle}: checking gas wallets`)
+      await topUpOperators()
+      setScenario(`cycle ${scenario.cycle}: resetting firm balances`)
+      await runScript('firms.ts')
+      setScenario(`cycle ${scenario.cycle}: market running`)
+      await runScript('sim.ts', { SIM_CYCLES: '1' })
+      failures = 0
+      scenario.error = ''
+    } catch (e) {
+      failures++
+      scenario.error = (e as Error).message.slice(0, 200)
+      console.error(`market cycle failed (${failures}/3):`, scenario.error)
+      setScenario(`cycle ${scenario.cycle} failed: ${scenario.error}`)
+      if (failures >= 3 || /master wallet low/.test(scenario.error)) {
+        scenario.loop = false
+        break
+      }
+      await new Promise((r) => setTimeout(r, 10_000))
+    }
+  } while (scenario.loop)
+  setScenario(scenario.error ? `stopped: ${scenario.error}` : 'done', false)
 }
 
 // ───────────────────────────── attestation ─────────────────────────────
@@ -230,27 +429,27 @@ async function attest() {
   if (expected !== enclave.measurement) {
     // Demo shortcut: the registry owner approves this build. In production this is a
     // governance action over a reproducible-build hash, done once per release.
-    const h = await owner.writeContract({
+    const h = await retrying(() => owner.writeContract({
       address: dep.registry,
       abi: abis.registry,
       functionName: 'approveMeasurement',
       args: [enclave.measurement],
-    })
+    }))
     await pub.waitForTransactionReceipt({ hash: h, pollingInterval: POLL_MS })
   }
   // Keys die with the enclave: revoke the previous boot's signer so only one is live.
   const previous = (await pub.readContract({ address: dep.registry, abi: abis.registry, functionName: 'latestSigner' })) as Hex
-  const h = await relayer.writeContract({
+  const h = await retrying(() => relayer.writeContract({
     address: dep.registry,
     abi: abis.registry,
     functionName: 'registerEnclave',
     args: [enclave.signer.address, enclave.encryptionKey, enclave.quote()],
-  })
+  }))
   await pub.waitForTransactionReceipt({ hash: h, pollingInterval: POLL_MS })
   if (previous !== '0x0000000000000000000000000000000000000000') {
     const stillActive = await pub.readContract({ address: dep.registry, abi: abis.registry, functionName: 'isActive', args: [previous] })
     if (stillActive) {
-      const r = await owner.writeContract({ address: dep.registry, abi: abis.registry, functionName: 'revoke', args: [previous] })
+      const r = await retrying(() => owner.writeContract({ address: dep.registry, abi: abis.registry, functionName: 'revoke', args: [previous] }))
       await pub.waitForTransactionReceipt({ hash: r, pollingInterval: POLL_MS })
       console.log(`   revoked previous enclave ${previous}`)
     }
@@ -270,6 +469,8 @@ async function attest() {
 
 // ───────────────────────────── per-block loop ─────────────────────────────
 let busy = false
+const pending = new Map<Hex, EvalResult & { order: NonNullable<EvalResult['order']> }>()
+let windowStart = 0n
 
 async function onBlock(n: bigint, timestamp: bigint) {
   if (busy) {
@@ -304,15 +505,7 @@ const ammOut = (amountIn: bigint, rIn: bigint, rOut: bigint) => {
 
 async function evaluateBlock(n: bigint, timestamp: bigint) {
   const t0 = performance.now()
-  const ctxBase = {
-    blockNumber: n,
-    timestamp,
-    pool: dep.pool,
-    oracle: dep.oracle,
-    amm: dep.amm,
-    base: dep.base,
-    quote: dep.quote,
-  }
+  const { firm: _, ...ctxBase } = ctxFor('0x0000000000000000000000000000000000000000', n, timestamp)
   const { results, reads } = await enclave.evaluate(sim, n, ctxBase, EVAL_MODE, READS)
   const [oraclePx, oracleBlock] = decodeRead(abis.oracle, 'latest', reads[0]) as [bigint, bigint]
   const rb = decodeRead(abis.amm, 'reserveBase', reads[1]) as bigint
@@ -331,6 +524,7 @@ async function evaluateBlock(n: bigint, timestamp: bigint) {
     results: results.map((r) => ({
       id: r.id,
       ms: r.ms,
+      gas: r.gas,
       batched: r.batched,
       error: r.error,
       order: r.order && { isBuy: r.order.isBuy, base: fmt(r.order.baseAmount) },
@@ -340,7 +534,21 @@ async function evaluateBlock(n: bigint, timestamp: bigint) {
   for (const r of results) if (r.error) console.warn(`strategy ${r.id.slice(0, 10)} error: ${r.error}`)
 
   // Mirror DarkPool.MAX_ORACLE_AGE_BLOCKS: a stale-oracle batch would only revert.
-  if (orders.length > 0 && n - oracleBlock <= 25n) await submitBatch(n, oraclePx, rb, rq, orders)
+  // Batch window: keep each strategy's latest intent and settle once every BATCH_EVERY_BLOCKS.
+  // Fewer txs (Monad bills the gas limit) and more crossing between neighbouring blocks.
+  for (const r of results) {
+    if (r.order) pending.set(r.id, r as EvalResult & { order: NonNullable<EvalResult['order']> })
+    else pending.delete(r.id)
+  }
+  if (windowStart === 0n) windowStart = n
+  if (n - windowStart + 1n < BATCH_EVERY_BLOCKS) return
+  windowStart = 0n
+  const window = [...pending.values()]
+  pending.clear()
+  if (window.length > 0 && n - oracleBlock <= 25n) {
+    const allowed = applyGuestPolicy(window)
+    if (allowed.length > 0) await submitBatch(n, oraclePx, rb, rq, allowed)
+  }
 }
 
 async function submitBatch(
@@ -352,7 +560,7 @@ async function submitBatch(
 ) {
   const batch: Batch = {
     batchId: n,
-    validUntilBlock: n + 3n, // Monad: guard on block.number (timestamps are 1s-granular)
+    validUntilBlock: n + VALID_FOR_BLOCKS, // Monad: guard on block.number (timestamps are 1s-granular)
     price: px,
     fills: orders.map((o) => ({ strategyId: o.id, isBuy: o.order.isBuy, baseAmount: o.order.baseAmount })),
   }
@@ -383,7 +591,7 @@ async function submitBatch(
 
     pub
       .waitForTransactionReceipt({ hash, pollingInterval: POLL_MS, timeout: 60_000 })
-      .then((r) => onReceipt(n, hash, r, { gasLimit, saved, sentAt, calldataBytes: (data.length - 2) / 2 }))
+      .then((r) => onReceipt(n, hash, r, { gasLimit, saved, previewCrossed: fmt(crossed), sentAt, calldataBytes: (data.length - 2) / 2 }))
       .catch((e) => fail(n, e))
   } catch (e) {
     fail(n, e)
@@ -394,7 +602,7 @@ function onReceipt(
   n: bigint,
   hash: Hex,
   r: Awaited<ReturnType<typeof pub.waitForTransactionReceipt>>,
-  meta: { gasLimit: bigint; saved: number; sentAt: number; calldataBytes: number },
+  meta: { gasLimit: bigint; saved: number; previewCrossed: number; sentAt: number; calldataBytes: number },
 ) {
   if (r.status !== 'success') return fail(n, new Error('reverted on-chain'))
   const logs = parseEventLogs({ abi: abis.pool, logs: r.logs }) as unknown as { eventName: string; args: Record<string, any> }[]
@@ -413,13 +621,16 @@ function onReceipt(
   const rejected = logs.filter((l) => l.eventName === 'FillRejected').map((l) => ({ id: l.args.strategyId, reason: Number(l.args.reason) }))
 
   const crossed = fmt(settled.crossedBase)
+  // Fills can be rejected on-chain (e.g. balance already spent by a batch in flight): only
+  // count savings for what actually crossed.
+  const saved = meta.previewCrossed > 0 ? (meta.saved * Math.min(crossed, meta.previewCrossed)) / meta.previewCrossed : 0
   const routedBase = settled.routedIsBuy ? fmt(settled.routedOut) : fmt(settled.routedIn)
   const price = fmt(settled.price)
   stats.batches++
   stats.crossedBase += crossed
   stats.routedBase += routedBase
   stats.crossedNotional += crossed * price
-  stats.savedUsd += meta.saved
+  stats.savedUsd += saved
   stats.gasLimitTotal += Number(meta.gasLimit)
   stats.gasUsedTotal += Number(r.gasUsed)
 
@@ -431,7 +642,7 @@ function onReceipt(
     crossed,
     routedBase,
     routedIsBuy: settled.routedIsBuy,
-    saved: meta.saved,
+    saved,
     gasUsed: Number(r.gasUsed),
     gasLimit: Number(meta.gasLimit),
     latencyMs: performance.now() - meta.sentAt,
@@ -443,7 +654,7 @@ function onReceipt(
   if (settlements.length > 200) settlements.shift()
   broadcast('settled', { settlement: s, stats })
   console.log(
-    `✅ batch@${n} → block ${r.blockNumber} | crossed ${crossed.toFixed(0)} MON | routed ${routedBase.toFixed(0)} MON | saved $${meta.saved.toFixed(2)}`,
+    `✅ batch@${n} → block ${r.blockNumber} | crossed ${crossed.toFixed(0)} MON | routed ${routedBase.toFixed(0)} MON | saved $${saved.toFixed(2)}`,
   )
 }
 
@@ -472,7 +683,10 @@ wsPub.watchBlocks({
   onError: (e) => console.error('block watcher:', e.message.split('\n')[0]),
 })
 
-if (AUTO_ONBOARD) {
+if (scenario.loop) {
+  // Always-on market: each cycle re-onboards/resets the house firms, so this also seals them.
+  void runMarket()
+} else if (AUTO_ONBOARD) {
   // Enclave keys are fresh on every boot, so the demo firms re-seal to the new key.
   runScript('firms.ts').catch((e) => console.error('auto-onboard failed:', e.message))
 }

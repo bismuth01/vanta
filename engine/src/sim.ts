@@ -3,13 +3,22 @@
 //   calm → sell-off (stop-loss vs dip-buyer cross) → bottom → rally (breakout vs
 //   take-profit cross) → top → mean-revert, then loops.
 import { parseUnits, type Hex } from 'viem'
-import { abis, ADMIN_TOKEN, clients, ENGINE_URL, KEYS, loadDeployment, POLL_MS, requireKey } from './config.ts'
+import { abis, ADMIN_TOKEN, clients, ENGINE_URL, IS_LOCAL, KEYS, loadDeployment, POLL_MS, requireKey, retrying } from './config.ts'
+
+// One-line failure reason for the engine's market loop (instead of a full viem error dump).
+const fatal = (e: any) => {
+  if (process.env.DEBUG_FATAL) console.error(e)
+  console.error(`FATAL: ${(e?.shortMessage ?? e?.message ?? String(e)).split('\n')[0]}${e?.details ? ` (${String(e.details).slice(0, 160)})` : ''}`)
+  process.exit(1)
+}
+process.on('uncaughtException', fatal)
+process.on('unhandledRejection', fatal)
 
 const dep = loadDeployment()
 const { pub, wallet } = clients(dep.chainId)
 const w = wallet(requireKey(KEYS.sim, 'sim'))
 const E18 = 10n ** 18n
-const STEP_MS = Number(process.env.SIM_STEP_MS ?? 600) // 2 Monad blocks
+const STEP_MS = Number(process.env.SIM_STEP_MS ?? (IS_LOCAL ? 600 : 2500)) // hosted: ~7 blocks per tick (each tick = 1–2 txs)
 const CYCLES = Number(process.env.SIM_CYCLES ?? Infinity) // hosted: 1 cycle per scenario run
 
 type Phase = { name: string; steps: number; to: number; noise: number }
@@ -23,7 +32,7 @@ const PHASES: Phase[] = [
 ]
 
 const write = async (address: Hex, abi: typeof abis.pool, functionName: string, args: unknown[]) =>
-  w.writeContract({ address, abi, functionName, args } as never)
+  retrying(() => w.writeContract({ address, abi, functionName, args } as never), 3, 300)
 
 function sqrt(n: bigint) {
   if (n < 2n) return n
@@ -58,7 +67,7 @@ async function arbTo(target: bigint) {
   const k = rb * rq
   const spot = (rq * E18) / rb
   const gap = spot > target ? spot - target : target - spot
-  if (gap * 10_000n < target * BigInt(process.env.SIM_ARB_BPS ?? 20)) return // small gaps: not worth the gas
+  if (gap * 10_000n < target * BigInt(process.env.SIM_ARB_BPS ?? (IS_LOCAL ? 10 : 25))) return // small gaps: not worth the gas
   const rb2 = sqrt((k * E18) / target)
   if (rb2 < rb) {
     const quoteIn = ((k / rb2 - rq) * 10_000n) / 9_970n
